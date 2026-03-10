@@ -31,6 +31,7 @@ struct AuthRequest {
   gboolean cleanup_started;
   gboolean result_ready;
   gboolean authenticated;
+  gchar* username;
   gchar* result_status;
   gchar* result_message;
 };
@@ -65,6 +66,54 @@ static void respond(FlMethodCall* method_call, FlMethodResponse* response) {
   if (!fl_method_call_respond(method_call, response, &error)) {
     g_warning("Failed to respond on fingerprint channel: %s", error->message);
   }
+}
+
+static const gchar* current_username() {
+  const gchar* username = g_get_user_name();
+  return username != nullptr ? username : "";
+}
+
+static gchar* describe_fprint_error(GError* error,
+                                    const gchar* fallback_message) {
+  if (error == nullptr) {
+    return g_strdup(fallback_message);
+  }
+
+  g_autofree gchar* remote_error = g_dbus_error_get_remote_error(error);
+  if (remote_error != nullptr) {
+    if (g_str_has_suffix(remote_error,
+                         ".net.reactivated.Fprint.Error.NoEnrolledPrints") ||
+        g_str_has_suffix(remote_error, ".NoEnrolledPrints")) {
+      return g_strdup("No fingerprints are enrolled for the current user.");
+    }
+
+    if (g_str_has_suffix(remote_error,
+                         ".net.reactivated.Fprint.Error.PermissionDenied") ||
+        g_str_has_suffix(remote_error, ".PermissionDenied")) {
+      return g_strdup(
+          "Fingerprint permission was denied by the Linux fingerprint service.");
+    }
+
+    if (g_str_has_suffix(remote_error,
+                         ".net.reactivated.Fprint.Error.AlreadyInUse") ||
+        g_str_has_suffix(remote_error, ".AlreadyInUse")) {
+      return g_strdup("Fingerprint reader is already in use.");
+    }
+
+    if (g_str_has_suffix(remote_error,
+                         ".net.reactivated.Fprint.Error.NoSuchDevice") ||
+        g_str_has_suffix(remote_error, ".NoSuchDevice")) {
+      return g_strdup("No fingerprint reader is available.");
+    }
+
+    if (g_str_has_suffix(remote_error,
+                         ".net.reactivated.Fprint.Error.ClaimDevice") ||
+        g_str_has_suffix(remote_error, ".ClaimDevice")) {
+      return g_strdup("Fingerprint reader could not be claimed.");
+    }
+  }
+
+  return g_strdup_printf("%s: %s", fallback_message, error->message);
 }
 
 static void free_availability_request(AvailabilityRequest* request) {
@@ -126,6 +175,7 @@ static void free_auth_request(AuthRequest* request) {
     g_object_unref(request->connection);
   }
   g_free(request->device_path);
+  g_free(request->username);
   g_free(request->result_status);
   g_free(request->result_message);
   delete request;
@@ -271,9 +321,8 @@ static void on_auth_verify_start_finished(GObject* object, GAsyncResult* result,
   (void)value;
 
   if (error != nullptr) {
-    g_autofree gchar* message =
-        g_strdup_printf("Failed to start fingerprint verification: %s",
-                        error->message);
+    g_autofree gchar* message = describe_fprint_error(
+        error, "Failed to start fingerprint verification");
     set_auth_result(request, FALSE, "failed", message);
     begin_auth_cleanup(request);
     return;
@@ -298,8 +347,7 @@ static void on_auth_claim_finished(GObject* object, GAsyncResult* result,
 
   if (error != nullptr) {
     g_autofree gchar* message =
-        g_strdup_printf("Failed to claim the fingerprint device: %s",
-                        error->message);
+        describe_fprint_error(error, "Failed to claim the fingerprint device");
     set_auth_result(request, FALSE, "failed", message);
     begin_auth_cleanup(request);
     return;
@@ -330,9 +378,8 @@ static void on_auth_default_device_finished(GObject* object,
       g_dbus_connection_call_finish(request->connection, result, &error);
 
   if (error != nullptr || value == nullptr) {
-    g_autofree gchar* message =
-        g_strdup_printf("No fingerprint reader is available: %s",
-                        error == nullptr ? "unknown error" : error->message);
+    g_autofree gchar* message = describe_fprint_error(
+        error, "No fingerprint reader is available");
     set_auth_result(request, FALSE, "unavailable", message);
     begin_auth_cleanup(request);
     return;
@@ -355,7 +402,8 @@ static void on_auth_default_device_finished(GObject* object,
 
   g_dbus_connection_call(request->connection, kFprintServiceName,
                          request->device_path, kDeviceInterface, "Claim",
-                         g_variant_new("(s)", ""), G_VARIANT_TYPE_UNIT,
+                         g_variant_new("(s)", request->username),
+                         G_VARIANT_TYPE_UNIT,
                          G_DBUS_CALL_FLAGS_NONE, -1, nullptr,
                          on_auth_claim_finished, request);
 }
@@ -369,8 +417,7 @@ static void on_auth_bus_ready(GObject* object, GAsyncResult* result,
 
   if (request->connection == nullptr) {
     g_autofree gchar* message =
-        g_strdup_printf("Failed to connect to the system bus: %s",
-                        error == nullptr ? "unknown error" : error->message);
+        describe_fprint_error(error, "Failed to connect to the system bus");
     set_auth_result(request, FALSE, "failed", message);
     begin_auth_cleanup(request);
     return;
@@ -411,40 +458,13 @@ static void start_authenticate(FingerprintChannel* self,
       FALSE,
       FALSE,
       FALSE,
+      g_strdup(current_username()),
       nullptr,
       nullptr,
   };
   self->active_auth_request = request;
 
   g_bus_get(G_BUS_TYPE_SYSTEM, nullptr, on_auth_bus_ready, request);
-}
-
-static void on_enrolled_fingers_finished(GObject* object, GAsyncResult* result,
-                                         gpointer user_data) {
-  (void)object;
-  AvailabilityRequest* request =
-      static_cast<AvailabilityRequest*>(user_data);
-  g_autoptr(GError) error = nullptr;
-  g_autoptr(GVariant) value =
-      g_dbus_connection_call_finish(request->connection, result, &error);
-
-  if (error != nullptr || value == nullptr) {
-    complete_availability_request(
-        request, FALSE, "unavailable",
-        "Fingerprint authentication is unavailable or not enrolled.");
-    return;
-  }
-
-  gchar** enrolled = nullptr;
-  g_variant_get(value, "(^as)", &enrolled);
-  const gboolean available =
-      enrolled != nullptr && enrolled[0] != nullptr && enrolled[0][0] != '\0';
-  g_strfreev(enrolled);
-
-  complete_availability_request(
-      request, available, available ? "available" : "unavailable",
-      available ? "Fingerprint authentication is available."
-                : "No fingerprints are enrolled for the current user.");
 }
 
 static void on_availability_default_device_finished(GObject* object,
@@ -458,18 +478,14 @@ static void on_availability_default_device_finished(GObject* object,
       g_dbus_connection_call_finish(request->connection, result, &error);
 
   if (error != nullptr || value == nullptr) {
-    complete_availability_request(request, FALSE, "unavailable",
-                                  "No fingerprint reader is available.");
+    g_autofree gchar* message =
+        describe_fprint_error(error, "No fingerprint reader is available");
+    complete_availability_request(request, FALSE, "unavailable", message);
     return;
   }
 
-  const gchar* device_path = nullptr;
-  g_variant_get(value, "(&o)", &device_path);
-  g_dbus_connection_call(request->connection, kFprintServiceName, device_path,
-                         kDeviceInterface, "ListEnrolledFingers",
-                         g_variant_new("(s)", ""), G_VARIANT_TYPE("(as)"),
-                         G_DBUS_CALL_FLAGS_NONE, -1, nullptr,
-                         on_enrolled_fingers_finished, request);
+  complete_availability_request(request, TRUE, "available",
+                                "Fingerprint reader is available.");
 }
 
 static void on_availability_bus_ready(GObject* object, GAsyncResult* result,
@@ -481,8 +497,9 @@ static void on_availability_bus_ready(GObject* object, GAsyncResult* result,
   request->connection = g_bus_get_finish(result, &error);
 
   if (request->connection == nullptr) {
-    complete_availability_request(request, FALSE, "failed",
-                                  "Failed to connect to the system bus.");
+    g_autofree gchar* message =
+        describe_fprint_error(error, "Failed to connect to the system bus");
+    complete_availability_request(request, FALSE, "failed", message);
     return;
   }
 

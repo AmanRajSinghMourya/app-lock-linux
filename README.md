@@ -4,7 +4,7 @@ This sample app reproduces the Ente auth Linux fingerprint flow in a smaller Flu
 
 What it mirrors:
 
-- `canAuthenticate` checks the Linux `fprintd` service over D-Bus
+- `canAuthenticate` checks that the Linux `fprintd` service can see a fingerprint reader
 - `authenticate` uses the Linux `fprintd` D-Bus device API directly
 - Flutter first checks availability, then triggers fingerprint verification
 
@@ -20,6 +20,7 @@ Important Linux caveat:
 - This is not a real OS biometric system prompt like macOS, iOS, Android, or Windows.
 - On Linux desktop with `fprintd`, there typically is no standard desktop biometric dialog for Flutter to summon.
 - The Flutter dialog is intentional: it gives a natural prompt without blocking the UI thread.
+- Enrollment and permission failures are surfaced during the auth attempt so the app does not falsely report a real reader as missing.
 
 Requirements on the Linux machine where you run it:
 
